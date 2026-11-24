@@ -561,6 +561,9 @@ public abstract class HttpMessageDecoder extends ReplayingDecoder<HttpMessageDec
             // Because this decoder did not call HttpMessage.setChunked(true)
             // yet, HttpMessage.isChunked() should return true only when
             // 'Transfer-Encoding' is 'chunked'.
+            if (!contentLengthHeaders.isEmpty() && HttpVersion.HTTP_1_1.equals(message.getProtocolVersion())) {
+                handleTransferEncodingChunkedWithContentLength(message);
+            }
             nextState = State.READ_CHUNK_SIZE;
         } else if (HttpHeaders.getContentLength(message, -1) >= 0) {
             nextState = State.READ_FIXED_LENGTH_CONTENT;
@@ -568,6 +571,31 @@ public abstract class HttpMessageDecoder extends ReplayingDecoder<HttpMessageDec
             nextState = State.READ_VARIABLE_LENGTH_CONTENT;
         }
         return nextState;
+    }
+
+    /**
+     * Invoked when a message with both a "Transfer-Encoding: chunked" and a "Content-Length" header field is detected.
+     * The default behavior is to <i>remove</i> the Content-Length field, but this method could be overridden
+     * to change the behavior (to, e.g., throw an exception and produce an invalid message).
+     * <p>
+     * See: https://tools.ietf.org/html/rfc7230#section-3.3.3
+     * <pre>
+     *     If a message is received with both a Transfer-Encoding and a
+     *     Content-Length header field, the Transfer-Encoding overrides the
+     *     Content-Length.  Such a message might indicate an attempt to
+     *     perform request smuggling (Section 9.5) or response splitting
+     *     (Section 9.4) and ought to be handled as an error.  A sender MUST
+     *     remove the received Content-Length field prior to forwarding such
+     *     a message downstream.
+     * </pre>
+     * Also see:
+     * https://github.com/apache/tomcat/blob/b693d7c1981fa7f51e58bc8c8e72e3fe80b7b773/
+     * java/org/apache/coyote/http11/Http11Processor.java#L747-L755
+     * https://github.com/nginx/nginx/blob/0ad4393e30c119d250415cb769e3d8bc8dce5186/
+     * src/http/ngx_http_request.c#L1946-L1953
+     */
+    protected void handleTransferEncodingChunkedWithContentLength(HttpMessage message) {
+        message.removeHeader(HttpHeaders.Names.CONTENT_LENGTH);
     }
 
     private HttpChunkTrailer readTrailingHeaders(ChannelBuffer buffer) throws TooLongFrameException {
