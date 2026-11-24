@@ -285,6 +285,168 @@ public class HttpMessageDecoderTest {
     }
 
     // ---------------------------------------------------------------------
+    // CVE-2026-42585: the 'chunked' transfer coding must be the final coding
+    // of the Transfer-Encoding header and must not be applied more than once,
+    // and requests whose final transfer coding is not 'chunked' must be
+    // rejected (RFC 9112 sections 6.1 and 6.3).
+    // Backport of netty/netty@485f11d, netty/netty@09f5588 and netty/netty@ca87393.
+    // ---------------------------------------------------------------------
+
+    @Test
+    public void testChunkedNotLastInTransferEncoding() {
+        String requestStr = "GET /some/path HTTP/1.1\r\n" +
+                "Transfer-Encoding: chunked, identity\r\n" +
+                "Content-Length: 1\r\n" +
+                "Host: netty.io\r\n\r\n" +
+                "a";
+        testInvalidHeaders0(requestStr);
+    }
+
+    // Regression: the chunked-must-be-last check must not be gated on HTTP/1.1.
+    @Test
+    public void testChunkedNotLastInTransferEncodingHttp10() {
+        String requestStr = "GET /some/path HTTP/1.0\r\n" +
+                "Transfer-Encoding: chunked, identity\r\n" +
+                "Content-Length: 1\r\n" +
+                "Host: netty.io\r\n\r\n" +
+                "a";
+        testInvalidHeaders0(requestStr);
+    }
+
+    // Companion to the test above: confirms the fix isn't tied to identity being a no-op
+    // by using a real trailing encoding (gzip) instead.
+    @Test
+    public void testChunkedNotLastInTransferEncodingHttp10NonNoOpEncoding() {
+        String requestStr = "GET /some/path HTTP/1.0\r\n" +
+                "Transfer-Encoding: chunked, gzip\r\n" +
+                "Content-Length: 1\r\n" +
+                "Host: netty.io\r\n\r\n" +
+                "a";
+        testInvalidHeaders0(requestStr);
+    }
+
+    @Test
+    public void testInvalidTransferEncodingFramingChunkedIdentityWithContentLength() {
+        testInvalidTransferEncodingFraming("Transfer-Encoding: chunked, identity\r\nContent-Length: 1\r\n");
+    }
+
+    @Test
+    public void testInvalidTransferEncodingFramingChunkedThenGzipMultiLine() {
+        testInvalidTransferEncodingFraming("Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n");
+    }
+
+    @Test
+    public void testInvalidTransferEncodingFramingChunkedGzipTrailingComma() {
+        testInvalidTransferEncodingFraming("Transfer-Encoding: chunked, gzip,\r\n");
+    }
+
+    @Test
+    public void testInvalidTransferEncodingFramingChunkedXchunked() {
+        testInvalidTransferEncodingFraming("Transfer-Encoding: chunked, xchunked\r\n");
+    }
+
+    @Test
+    public void testInvalidTransferEncodingFramingGzipOnly() {
+        testInvalidTransferEncodingFraming("Transfer-Encoding: gzip\r\n");
+    }
+
+    @Test
+    public void testInvalidTransferEncodingFramingChunkedSpaceGzipWithContentLength() {
+        testInvalidTransferEncodingFraming("Transfer-Encoding: chunked gzip\r\nContent-Length: 1\r\n");
+    }
+
+    @Test
+    public void testInvalidTransferEncodingFramingChunkedTwice() {
+        testInvalidTransferEncodingFraming("Transfer-Encoding: chunked, chunked\r\n");
+    }
+
+    @Test
+    public void testInvalidTransferEncodingFramingChunkedGzipChunked() {
+        testInvalidTransferEncodingFraming("Transfer-Encoding: chunked, gzip, chunked\r\n");
+    }
+
+    @Test
+    public void testInvalidTransferEncodingFramingChunkedTwiceMultiLine() {
+        testInvalidTransferEncodingFraming("Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n");
+    }
+
+    @Test
+    public void testInvalidTransferEncodingFramingChunkedTwiceMixedCase() {
+        testInvalidTransferEncodingFraming("Transfer-Encoding: Chunked, , CHUNKED,\r\n");
+    }
+
+    @Test
+    public void testInvalidTransferEncodingFramingChunkedWithParameter() {
+        testInvalidTransferEncodingFraming("Transfer-Encoding: chunked;foo=bar\r\n");
+    }
+
+    private static void testInvalidTransferEncodingFraming(String headers) {
+        testInvalidHeaders0("GET /some/path HTTP/1.1\r\n" + headers + "Host: netty.io\r\n\r\n");
+    }
+
+    @Test
+    public void testChunkedLastInMultiLineTransferEncoding() {
+        testChunkedLastInMultiLineTransferEncoding(
+                "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n");
+    }
+
+    @Test
+    public void testChunkedLastInMultiLineTransferEncodingTrailingComma() {
+        testChunkedLastInMultiLineTransferEncoding(
+                "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked,\r\n");
+    }
+
+    @Test
+    public void testChunkedLastInMultiLineTransferEncodingEmptyElements() {
+        testChunkedLastInMultiLineTransferEncoding(
+                "Transfer-Encoding: chunked\r\nTransfer-Encoding: , \t,\r\n");
+    }
+
+    private static void testChunkedLastInMultiLineTransferEncoding(String transferEncodingHeaders) {
+        String requestStr = "GET /some/path HTTP/1.1\r\n" +
+                transferEncodingHeaders +
+                "Host: netty.io\r\n\r\n" +
+                "0\r\n\r\n";
+        DecoderEmbedder<Object> embedder = new DecoderEmbedder<Object>(new HttpRequestDecoder());
+        assertTrue(embedder.offer(ChannelBuffers.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+
+        HttpRequest request = (HttpRequest) embedder.poll();
+        assertTrue(request.isChunked());
+        assertEquals(2, request.getHeaders(HttpHeaders.Names.TRANSFER_ENCODING).size());
+        HttpChunk chunk = (HttpChunk) embedder.poll();
+        assertTrue(chunk.isLast());
+        assertNull(embedder.poll());
+    }
+
+    @Test
+    public void testChunkedNotLastInTransferEncodingResponse() {
+        String responseStr = "HTTP/1.1 200 OK\r\n" +
+                "Transfer-Encoding: chunked, gzip\r\n" +
+                "Content-Length: 1\r\n\r\n" +
+                "a";
+        testInvalidResponseHeaders0(ChannelBuffers.copiedBuffer(responseStr, CharsetUtil.US_ASCII));
+    }
+
+    @Test
+    public void testTransferCodingGzipResponseReadsUntilClose() {
+        // Unlike requests, a response without a final chunked coding may still be framed by
+        // reading until the connection is closed, so it must not be rejected.
+        String responseStr = "HTTP/1.1 200 OK\r\n" +
+                "Connection: close\r\n" +
+                "Transfer-Encoding: gzip\r\n\r\n" +
+                "hello";
+        DecoderEmbedder<Object> embedder = new DecoderEmbedder<Object>(new HttpResponseDecoder());
+        assertTrue(embedder.offer(ChannelBuffers.copiedBuffer(responseStr, CharsetUtil.US_ASCII)));
+
+        HttpResponse response = (HttpResponse) embedder.poll();
+        assertNotNull(response);
+        assertEquals("gzip", response.getHeader(HttpHeaders.Names.TRANSFER_ENCODING));
+        assertFalse(response.containsHeader(HttpHeaders.Names.CONTENT_LENGTH));
+        HttpChunk chunk = (HttpChunk) embedder.poll();
+        assertEquals("hello", chunk.getContent().toString(CharsetUtil.US_ASCII));
+    }
+
+    // ---------------------------------------------------------------------
     // GHSA-wx5j-54mm-rqqq: header names must be bracketed by OWS only.
     // The decoder used to silently strip every Character.isWhitespace char,
     // which let an attacker smuggle control characters around a header name.
