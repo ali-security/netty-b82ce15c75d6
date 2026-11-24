@@ -618,6 +618,279 @@ public class HttpMessageDecoderTest {
         assertEquals("netty.io", response.getHeader(HttpHeaders.Names.HOST));
     }
 
+    // ---------------------------------------------------------------------
+    // CVE-2026-93566: the chunk-size line must follow the RFC 9112 grammar
+    // (chunk-size [ BWS ";" chunk-ext ]). Leading whitespace, whitespace that
+    // is not followed by chunk-extensions, extra tokens and control characters
+    // must be rejected instead of being trimmed or truncated, otherwise a peer
+    // that parses the line differently can be desynchronized (request smuggling).
+    // Backport of netty/netty@161f9ad.
+    // ---------------------------------------------------------------------
+
+    @Test
+    public void testRequestChunkSizeEmpty() {
+        testInvalidRequestChunkSize("");
+    }
+
+    @Test
+    public void testRequestChunkSizeTrailingWhitespace() {
+        testInvalidRequestChunkSize("5 ");
+    }
+
+    @Test
+    public void testRequestChunkSizeLeadingWhitespace() {
+        testInvalidRequestChunkSize(" 5");
+    }
+
+    @Test
+    public void testRequestChunkSizeWhitespaceThenHexDigit() {
+        testInvalidRequestChunkSize("5 c");
+    }
+
+    @Test
+    public void testRequestChunkSizeWhitespaceThenToken() {
+        testInvalidRequestChunkSize("5 x");
+    }
+
+    @Test
+    public void testRequestChunkSizeWhitespaceThenHexDigitAndExtension() {
+        testInvalidRequestChunkSize("5 c;foo=bar");
+    }
+
+    @Test
+    public void testRequestChunkSizeLeadingWhitespaceThenHexDigit() {
+        testInvalidRequestChunkSize("  5 c");
+    }
+
+    @Test
+    public void testRequestChunkSizeLeadingWhitespaceThenToken() {
+        testInvalidRequestChunkSize("  5 x");
+    }
+
+    @Test
+    public void testRequestChunkSizeLeadingWhitespaceThenHexDigitAndExtension() {
+        testInvalidRequestChunkSize("  5 c;foo=bar");
+    }
+
+    @Test
+    public void testRequestChunkSizeWithPlusSign() {
+        testInvalidRequestChunkSize("+5");
+    }
+
+    @Test
+    public void testRequestChunkSizeWithMinusSign() {
+        testInvalidRequestChunkSize("-0");
+    }
+
+    @Test
+    public void testRequestChunkSizeWithNulChar() {
+        testInvalidRequestChunkSize("5\u0000");
+    }
+
+    @Test
+    public void testRequestChunkSizeWithVerticalTab() {
+        testInvalidRequestChunkSize("5\u000b");
+    }
+
+    @Test
+    public void testRequestChunkSizeWithFormFeed() {
+        testInvalidRequestChunkSize("5\f");
+    }
+
+    @Test
+    public void testRequestChunkSizeWithBareCr() {
+        testInvalidRequestChunkSize("5\rX");
+    }
+
+    @Test
+    public void testRequestChunkSizeWithTrailingBareCr() {
+        testInvalidRequestChunkSize("5\r");
+    }
+
+    @Test
+    public void testRequestChunkSizeOverflow() {
+        testInvalidRequestChunkSize("80000000", "Chunk size overflow");
+    }
+
+    @Test
+    public void testResponseChunkSizeEmpty() {
+        testInvalidResponseChunkSize("");
+    }
+
+    @Test
+    public void testResponseChunkSizeTrailingWhitespace() {
+        testInvalidResponseChunkSize("5 ");
+    }
+
+    @Test
+    public void testResponseChunkSizeLeadingWhitespace() {
+        testInvalidResponseChunkSize(" 5");
+    }
+
+    @Test
+    public void testResponseChunkSizeWhitespaceThenHexDigit() {
+        testInvalidResponseChunkSize("5 c");
+    }
+
+    @Test
+    public void testResponseChunkSizeWhitespaceThenToken() {
+        testInvalidResponseChunkSize("5 x");
+    }
+
+    @Test
+    public void testResponseChunkSizeWhitespaceThenHexDigitAndExtension() {
+        testInvalidResponseChunkSize("5 c;foo=bar");
+    }
+
+    @Test
+    public void testResponseChunkSizeLeadingWhitespaceThenHexDigit() {
+        testInvalidResponseChunkSize("  5 c");
+    }
+
+    @Test
+    public void testResponseChunkSizeLeadingWhitespaceThenToken() {
+        testInvalidResponseChunkSize("  5 x");
+    }
+
+    @Test
+    public void testResponseChunkSizeLeadingWhitespaceThenHexDigitAndExtension() {
+        testInvalidResponseChunkSize("  5 c;foo=bar");
+    }
+
+    @Test
+    public void testResponseChunkSizeWithNulChar() {
+        testInvalidResponseChunkSize("5\u0000");
+    }
+
+    @Test
+    public void testResponseChunkSizeWithBareCr() {
+        testInvalidResponseChunkSize("5\rX");
+    }
+
+    @Test
+    public void testValidChunkSizeWithExtensions() {
+        String requestStr = "POST / HTTP/1.1\r\n" +
+                "Host: example\r\n" +
+                "Transfer-Encoding: chunked\r\n" +
+                "\r\n" +
+                "5;foo=bar\r\n" +
+                "hello\r\n" +
+                "0A \t;foo\r\n" +
+                "0123456789\r\n" +
+                "0 ;foo=bar\r\n" +
+                "\r\n";
+
+        DecoderEmbedder<Object> embedder = new DecoderEmbedder<Object>(new HttpRequestDecoder());
+        assertTrue(embedder.offer(ChannelBuffers.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+
+        HttpRequest request = (HttpRequest) embedder.poll();
+        assertTrue(request.isChunked());
+        HttpChunk chunk = (HttpChunk) embedder.poll();
+        assertEquals("hello", chunk.getContent().toString(CharsetUtil.US_ASCII));
+        chunk = (HttpChunk) embedder.poll();
+        assertEquals("0123456789", chunk.getContent().toString(CharsetUtil.US_ASCII));
+        assertTrue(((HttpChunk) embedder.poll()).isLast());
+        assertNull(embedder.poll());
+    }
+
+    @Test
+    public void testValidChunkSizeLineSplitAcrossBuffers() {
+        DecoderEmbedder<Object> embedder = new DecoderEmbedder<Object>(new HttpRequestDecoder());
+        assertTrue(embedder.offer(ChannelBuffers.copiedBuffer("POST / HTTP/1.1\r\n" +
+                "Host: example\r\n" +
+                "Transfer-Encoding: chunked\r\n" +
+                "\r\n" +
+                "5\r", CharsetUtil.US_ASCII)));
+        assertTrue(embedder.offer(ChannelBuffers.copiedBuffer("\nhello\r\n0\r\n\r\n", CharsetUtil.US_ASCII)));
+
+        HttpRequest request = (HttpRequest) embedder.poll();
+        assertTrue(request.isChunked());
+        HttpChunk chunk = (HttpChunk) embedder.poll();
+        assertEquals("hello", chunk.getContent().toString(CharsetUtil.US_ASCII));
+        assertTrue(((HttpChunk) embedder.poll()).isLast());
+        assertNull(embedder.poll());
+    }
+
+    private static void testInvalidRequestChunkSize(String chunkSizeLine) {
+        testInvalidRequestChunkSize(chunkSizeLine, "chunk size");
+    }
+
+    private static void testInvalidRequestChunkSize(String chunkSizeLine, String expectedErrorMessage) {
+        String requestStr = "POST / HTTP/1.1\r\n" +
+                "Host: example\r\n" +
+                "Transfer-Encoding: chunked\r\n" +
+                "\r\n" +
+                chunkSizeLine + "\r\n" +
+                "GPOST\r\n" +
+                "0\r\n" +
+                "\r\n" +
+                "GET /smuggled HTTP/1.1\r\n" +
+                "Host: example\r\n" +
+                "\r\n";
+
+        DecoderEmbedder<Object> embedder = new DecoderEmbedder<Object>(new HttpRequestDecoder());
+        assertChunkSizeRejected(embedder, requestStr, expectedErrorMessage);
+
+        // The request headers parse fine.
+        HttpRequest request = (HttpRequest) embedder.poll();
+        assertNotNull(request);
+        assertEquals(HttpVersion.HTTP_1_1, request.getProtocolVersion());
+        assertEquals(HttpMethod.POST, request.getMethod());
+        assertTrue(request.isChunked());
+
+        assertNothingDecodedAfterChunkSize(embedder);
+    }
+
+    private static void testInvalidResponseChunkSize(String chunkSizeLine) {
+        String responseStr = "HTTP/1.1 200 OK\r\n" +
+                "Transfer-Encoding: chunked\r\n" +
+                "\r\n" +
+                chunkSizeLine + "\r\n" + // malformed chunk size
+                "GPOST\r\n" +
+                "0\r\n" +
+                "\r\n" +
+                "HTTP/1.1 200 smuggled\r\n" +
+                "Host: example\r\n" +
+                "\r\n";
+
+        DecoderEmbedder<Object> embedder = new DecoderEmbedder<Object>(new HttpResponseDecoder());
+        assertChunkSizeRejected(embedder, responseStr, "chunk size");
+
+        // The response headers parse fine.
+        HttpResponse response = (HttpResponse) embedder.poll();
+        assertNotNull(response);
+        assertEquals(HttpVersion.HTTP_1_1, response.getProtocolVersion());
+        assertEquals(200, response.getStatus().getCode());
+        assertTrue(response.isChunked());
+
+        assertNothingDecodedAfterChunkSize(embedder);
+    }
+
+    private static void assertChunkSizeRejected(
+            DecoderEmbedder<Object> embedder, String message, String expectedErrorMessage) {
+        try {
+            embedder.offer(ChannelBuffers.copiedBuffer(message, CharsetUtil.ISO_8859_1));
+            fail("Expected CodecEmbedderException");
+        } catch (CodecEmbedderException e) {
+            // The malformed chunk-size line must be rejected, not truncated at the whitespace.
+            Throwable cause = e.getCause();
+            assertTrue(String.valueOf(cause), cause instanceof NumberFormatException);
+            assertTrue(cause.getMessage(), cause.getMessage().contains(expectedErrorMessage));
+        }
+    }
+
+    private static void assertNothingDecodedAfterChunkSize(DecoderEmbedder<Object> embedder) {
+        // Nothing after the failed chunk may be surfaced as content or as a second, smuggled message.
+        assertNull(embedder.poll());
+        try {
+            embedder.finish();
+        } catch (CodecEmbedderException e) {
+            // The same malformed chunk-size line is rejected again when the remaining input is flushed.
+            assertTrue(String.valueOf(e.getCause()), e.getCause() instanceof NumberFormatException);
+        }
+        assertNull(embedder.poll());
+    }
+
     private static void testInvalidHeaders0(String requestStr) {
         testInvalidRequestHeaders0(ChannelBuffers.copiedBuffer(requestStr, CharsetUtil.US_ASCII));
     }
