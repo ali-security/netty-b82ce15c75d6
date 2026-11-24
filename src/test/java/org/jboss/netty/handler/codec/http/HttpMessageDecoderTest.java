@@ -316,6 +316,36 @@ public class HttpMessageDecoderTest {
         testInvalidResponseHeaders0(responseBuffer);
     }
 
+    // ---------------------------------------------------------------------
+    // CVE-2019-16869: no whitespace is allowed between a header field-name and
+    // the colon (RFC 7230 section 3.2.4). For requests this must be rejected
+    // (400 Bad Request); for responses the whitespace is silently skipped so
+    // that interop with non-compliant servers is preserved.
+    // Backport of netty/netty@39cafcb (issue #9571 / PR #9585).
+    // ---------------------------------------------------------------------
+
+    @Test
+    public void testWhitespaceInRequestHeaderName() {
+        String requestStr = "GET /some/path HTTP/1.1\r\n" +
+                "Transfer-Encoding : chunked\r\n" +
+                "Host: netty.io\r\n\r\n";
+        testInvalidRequestHeaders0(ChannelBuffers.copiedBuffer(requestStr, CharsetUtil.US_ASCII));
+    }
+
+    @Test
+    public void testWhitespaceInResponseHeaderName() {
+        String responseStr = "HTTP/1.1 200 OK\r\n" +
+                "Transfer-Encoding : chunked\r\n" +
+                "Host: netty.io\r\n\r\n";
+        DecoderEmbedder<Object> embedder = new DecoderEmbedder<Object>(new HttpResponseDecoder());
+        embedder.offer(ChannelBuffers.copiedBuffer(responseStr, CharsetUtil.US_ASCII));
+        HttpResponse response = (HttpResponse) embedder.poll();
+        assertNotNull(response);
+        assertEquals(HttpHeaders.Values.CHUNKED,
+                response.getHeader(HttpHeaders.Names.TRANSFER_ENCODING));
+        assertEquals("netty.io", response.getHeader(HttpHeaders.Names.HOST));
+    }
+
     private static void testInvalidHeaders0(String requestStr) {
         testInvalidRequestHeaders0(ChannelBuffers.copiedBuffer(requestStr, CharsetUtil.US_ASCII));
     }
